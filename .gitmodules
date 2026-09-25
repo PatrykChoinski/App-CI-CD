@@ -1,0 +1,3 @@
+[submodule "PLC"]
+	path = PLC
+	url = https://github.com/PatrykChoinski/Diadesigner-AX-CI-CD.git
