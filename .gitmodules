@@ -1,3 +1,6 @@
 [submodule "PLC"]
 	path = PLC
 	url = https://github.com/PatrykChoinski/Diadesigner-AX-CI-CD.git
+[submodule "HMI"]
+	path = HMI
+	url = https://github.com/PatrykChoinski/DIAScreen-CI-CD.git
