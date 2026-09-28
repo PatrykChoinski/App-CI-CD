@@ -1,0 +1,211 @@
+name: App CI (PLC -> HMI)
+
+# Runs the PLC (DIADesigner-AX) pipeline, then - only if it passed - the HMI
+# (DIAScreen) pipeline, both against the submodule commits pinned in this
+# repo. Each job reuses its submodule's own scripts, running from inside the
+# submodule directory, so they behave exactly as in the submodule's own CI.
+#
+# The two jobs run on separate hosted VMs: this checks that the pinned pair of
+# commits builds and runs, not that the HMI talks to the PLC.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      latest_submodules:
+        description: "Test the latest master of PLC and HMI instead of the pinned commits"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  checks: write        # dorny/test-reporter publishes a check run
+
+concurrency:
+  group: app-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PLC_REPO: PatrykChoinski/Diadesigner-AX-CI-CD
+  HMI_REPO: PatrykChoinski/DIAScreen-CI-CD
+  # How long each application must keep running for its smoke test to pass.
+  OBSERVE_SECONDS: "30"
+
+jobs:
+  plc:
+    name: PLC (DIADesigner-AX)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: PLC
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Init PLC submodule
+        working-directory: .
+        shell: pwsh
+        run: |
+          git submodule update --init PLC
+          if ('${{ inputs.latest_submodules }}' -eq 'true') { git submodule update --remote PLC }
+          git -C PLC log -1 --format="PLC commit: %H %s"
+
+      # Installer/archive asset names live in the submodule's own workflow;
+      # read them from there so bumping the submodule is enough.
+      - name: Read installer versions from PLC workflow
+        shell: pwsh
+        run: |
+          $yml = Get-Content .github/workflows/diadesigner-ci.yml
+          foreach ($key in 'INSTALLERS_RELEASE_TAG','DIA_BUNDLE_ASSET','PROJECT_ARCHIVE_RELEASE_TAG','PROJECT_ARCHIVE_ASSET') {
+            $m = $yml | Select-String -Pattern "^\s+${key}:\s*`"(.+)`"" | Select-Object -First 1
+            if (-not $m) { throw "$key not found in PLC/.github/workflows/diadesigner-ci.yml" }
+            "$key=$($m.Matches[0].Groups[1].Value)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Download DIADesigner-AX installer bundle
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path installers | Out-Null
+          gh release download "$env:INSTALLERS_RELEASE_TAG" --repo "$env:PLC_REPO" `
+            --pattern "$env:DIA_BUNDLE_ASSET" --dir installers --clobber
+
+      - name: Extract DIADesigner-AX installer bundle
+        shell: pwsh
+        run: ./scripts/Expand-Zip.ps1 -ZipPath "installers\$env:DIA_BUNDLE_ASSET" -DestinationDir installers\bundle
+
+      - name: Install DIADesigner-AX
+        shell: pwsh
+        run: ./scripts/Install-DIADesignerAX.ps1 -BundleDir installers\bundle
+
+      - name: Download project archive (device/library priming asset)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "$env:PROJECT_ARCHIVE_RELEASE_TAG" --repo "$env:PLC_REPO" `
+            --pattern "$env:PROJECT_ARCHIVE_ASSET" --dir . --clobber
+
+      - name: Compile project
+        shell: pwsh
+        env:
+          PROJECT_PASSWORD: ${{ secrets.PLC_PROJECT_PASSWORD }}
+        run: ./scripts/Invoke-DiaBuild.ps1
+
+      - name: Deploy to CODESYS Control Win V3 x64 SoftMotion and smoke test
+        shell: pwsh
+        env:
+          PROJECT_PASSWORD: ${{ secrets.PLC_PROJECT_PASSWORD }}
+        run: ./scripts/Invoke-DiaDeployTest.ps1 -BundleDir installers\bundle -ObserveSeconds $env:OBSERVE_SECONDS
+
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plc-reports
+          path: |
+            PLC/reports/*.xml
+            PLC/reports/*.log
+            PLC/reports/*.csv
+          if-no-files-found: warn
+
+      - name: Publish test summary
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: PLC tests
+          path: PLC/reports/junit-*.xml
+          reporter: java-junit
+          fail-on-error: true
+          fail-on-empty: false
+
+      - name: Write consolidated report
+        if: always()
+        shell: pwsh
+        run: ./scripts/Write-Summary.ps1
+
+  hmi:
+    name: HMI (DIAScreen)
+    needs: plc
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: HMI
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Init HMI submodule
+        working-directory: .
+        shell: pwsh
+        run: |
+          git submodule update --init HMI
+          if ('${{ inputs.latest_submodules }}' -eq 'true') { git submodule update --remote HMI }
+          git -C HMI log -1 --format="HMI commit: %H %s"
+
+      - name: Read installer versions from HMI workflow
+        shell: pwsh
+        run: |
+          $yml = Get-Content .github/workflows/diascreen-ci.yml
+          foreach ($key in 'INSTALLERS_RELEASE_TAG','DIASCREEN_INSTALLER_ASSET') {
+            $m = $yml | Select-String -Pattern "^\s+${key}:\s*`"(.+)`"" | Select-Object -First 1
+            if (-not $m) { throw "$key not found in HMI/.github/workflows/diascreen-ci.yml" }
+            "$key=$($m.Matches[0].Groups[1].Value)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Download DIAScreen installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path installers | Out-Null
+          gh release download "$env:INSTALLERS_RELEASE_TAG" --repo "$env:HMI_REPO" `
+            --pattern "$env:DIASCREEN_INSTALLER_ASSET" --dir installers --clobber
+
+      - name: Install DIAScreen
+        shell: pwsh
+        run: ./scripts/Install-DIAScreen.ps1 -InstallerPath "installers\$env:DIASCREEN_INSTALLER_ASSET"
+
+      - name: Compile project and run On-line Simulation
+        # Windows PowerShell 5.1 - the script's Add-Type Win32 helpers target
+        # .NET Framework.
+        shell: powershell
+        env:
+          PROJECT_PASSWORD: ${{ secrets.HMI_PROJECT_PASSWORD }}
+        run: ./scripts/Invoke-DiaScreenTest.ps1 -DiaScreenExe "$env:DIASCREEN_EXE" -ObserveSeconds $env:OBSERVE_SECONDS
+
+      - name: Upload reports, logs and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hmi-reports
+          path: |
+            HMI/reports/*.xml
+            HMI/reports/*.log
+            HMI/reports/*.png
+          if-no-files-found: warn
+
+      - name: Publish test summary
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: HMI tests
+          path: HMI/reports/junit-*.xml
+          reporter: java-junit
+          fail-on-error: true
+          fail-on-empty: false
+
+      - name: Write consolidated report
+        if: always()
+        shell: pwsh
+        run: ./scripts/Write-Summary.ps1
