@@ -157,24 +157,35 @@ jobs:
         shell: pwsh
         run: |
           $yml = Get-Content .github/workflows/diascreen-ci.yml
-          foreach ($key in 'INSTALLERS_RELEASE_TAG','DIASCREEN_INSTALLER_ASSET') {
+          foreach ($key in 'DIASCREEN_VERSION','INSTALLERS_RELEASE_TAG','DIASCREEN_BASE_ASSET','DIASCREEN_PATCH_ASSET','PANEL_PACKAGE_ASSET') {
             $m = $yml | Select-String -Pattern "^\s+${key}:\s*`"(.+)`"" | Select-Object -First 1
             if (-not $m) { throw "$key not found in HMI/.github/workflows/diascreen-ci.yml" }
             "$key=$($m.Matches[0].Groups[1].Value)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
 
-      - name: Download DIAScreen installer
+      - name: Download DIAScreen installers (1.8 base + 1.8.1 patch + AX-8 panel package)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           New-Item -ItemType Directory -Force -Path installers | Out-Null
-          gh release download "$env:INSTALLERS_RELEASE_TAG" --repo "$env:HMI_REPO" `
-            --pattern "$env:DIASCREEN_INSTALLER_ASSET" --dir installers --clobber
+          foreach ($asset in $env:DIASCREEN_BASE_ASSET, $env:DIASCREEN_PATCH_ASSET, $env:PANEL_PACKAGE_ASSET) {
+            gh release download "$env:INSTALLERS_RELEASE_TAG" --repo "$env:HMI_REPO" `
+              --pattern "$asset" --dir installers --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Download of $asset failed" }
+          }
 
-      - name: Install DIAScreen
-        shell: pwsh
-        run: ./scripts/Install-DIAScreen.ps1 -InstallerPath "installers\$env:DIASCREEN_INSTALLER_ASSET"
+      - name: Install DIAScreen 1.8 + 1.8.1 patch
+        # Windows PowerShell 5.1 - uses the Win32 helpers for its watchdog.
+        shell: powershell
+        run: |
+          ./scripts/Install-DIAScreen.ps1 `
+            -BaseInstallerPath "installers\$env:DIASCREEN_BASE_ASSET" `
+            -PatchInstallerPath "installers\$env:DIASCREEN_PATCH_ASSET"
+
+      - name: Install AX-8(Windows) HMI series package
+        shell: powershell
+        run: ./scripts/Install-PanelPackage.ps1 -ZipPath "installers\$env:PANEL_PACKAGE_ASSET"
 
       - name: Compile project and run On-line Simulation
         # Windows PowerShell 5.1 - the script's Add-Type Win32 helpers target
@@ -182,7 +193,7 @@ jobs:
         shell: powershell
         env:
           PROJECT_PASSWORD: ${{ secrets.HMI_PROJECT_PASSWORD }}
-        run: ./scripts/Invoke-DiaScreenTest.ps1 -DiaScreenExe "$env:DIASCREEN_EXE" -ObserveSeconds $env:OBSERVE_SECONDS
+        run: ./scripts/Invoke-DiaScreenTest.ps1 -DiaScreenExe "$env:DIASCREEN_EXE" -ObserveSeconds $env:OBSERVE_SECONDS -ExpectedVersion $env:DIASCREEN_VERSION
 
       - name: Upload reports, logs and screenshots
         if: always()
@@ -193,6 +204,7 @@ jobs:
             HMI/reports/*.xml
             HMI/reports/*.log
             HMI/reports/*.png
+            HMI/reports/*.txt
           if-no-files-found: warn
 
       - name: Publish test summary
